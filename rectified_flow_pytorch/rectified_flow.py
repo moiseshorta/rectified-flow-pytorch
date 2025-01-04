@@ -739,12 +739,15 @@ class Unet(Module):
     ):
         super().__init__()
 
-        # Add text conditioning projection
+        # Improved text projection with dropout
         self.text_proj = nn.Sequential(
             nn.Linear(text_embed_dim, dim * 4),
             nn.GELU(),
-            nn.Linear(dim * 4, dim * 4)
+            nn.Dropout(dropout),  # Add dropout after activation
+            nn.Linear(dim * 4, dim * 4),
+            nn.Dropout(dropout)   # Add dropout after final projection
         )
+        self.text_norm = nn.LayerNorm(dim * 4)  # Add normalization for text projections
 
         # determine dimensions
 
@@ -843,9 +846,12 @@ class Unet(Module):
 
         t = self.time_mlp(times)
 
-        # Process time and text embeddings
+        # Process text conditioning with training awareness
         if exists(text_embeds):
             text_cond = self.text_proj(text_embeds)
+            text_cond = self.text_norm(text_cond)  # Normalize conditioning
+            if self.training:  # Only apply additional dropout during training
+                text_cond = F.dropout(text_cond, p=self.dropout, training=self.training)
             t = t + text_cond
 
         x = self.init_conv(x)
