@@ -292,16 +292,22 @@ class RectifiedFlow(Module):
     def predict_flow(self, model: Module, noised, *, times, text_embeds=None, eps = 1e-10):
         batch = noised.shape[0]
         model_kwargs = dict()
-        time_kwarg = self.time_cond_kwarg
 
+        # Handle time conditioning
+        time_kwarg = self.time_cond_kwarg
         if exists(time_kwarg):
             times = rearrange(times, '... -> (...)')
             if times.numel() == 1:
                 times = repeat(times, '1 -> b', b = batch)
             model_kwargs.update(**{time_kwarg: times})
 
-        # Add text conditioning
+        # Improved text conditioning
         if exists(text_embeds):
+            # Ensure text embeddings match batch size
+            if text_embeds.shape[0] == 1:
+                text_embeds = repeat(text_embeds, '1 ... -> b ...', b=batch)
+            elif text_embeds.shape[0] != batch:
+                raise ValueError(f'Text embeddings batch size {text_embeds.shape[0]} must match input batch size {batch}')
             model_kwargs['text_embeds'] = text_embeds
 
         output = self.model(noised, **model_kwargs)
@@ -739,13 +745,15 @@ class Unet(Module):
     ):
         super().__init__()
 
-        # Improved text projection with dropout
+        # Improved text embedding projection
         self.text_proj = nn.Sequential(
+            nn.LayerNorm(text_embed_dim),  # Normalize first
             nn.Linear(text_embed_dim, dim * 4),
             nn.GELU(),
-            nn.Dropout(dropout),  # Add dropout after activation
+            nn.Dropout(dropout),
             nn.Linear(dim * 4, dim * 4),
-            nn.Dropout(dropout)   # Add dropout after final projection
+            nn.LayerNorm(dim * 4),  # Additional normalization
+            nn.Dropout(dropout)
         )
         self.text_norm = nn.LayerNorm(dim * 4)  # Add normalization for text projections
 
@@ -846,12 +854,15 @@ class Unet(Module):
 
         t = self.time_mlp(times)
 
-        # Process text conditioning with training awareness
+        # Enhanced text conditioning
         if exists(text_embeds):
             text_cond = self.text_proj(text_embeds)
-            text_cond = self.text_norm(text_cond)  # Normalize conditioning
-            if self.training:  # Only apply additional dropout during training
-                text_cond = F.dropout(text_cond, p=self.dropout, training=self.training)
+
+            # Cross-attention style conditioning
+            text_cond = rearrange(text_cond, 'b d -> b d 1 1')
+            t = t.unsqueeze(-1).unsqueeze(-1)  # Make compatible for broadcasting
+
+            # Combine time and text conditioning
             t = t + text_cond
 
         x = self.init_conv(x)
