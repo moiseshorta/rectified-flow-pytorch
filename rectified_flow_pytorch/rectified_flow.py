@@ -755,7 +755,7 @@ class Unet(Module):
             nn.LayerNorm(dim * 4),  # Additional normalization
             nn.Dropout(dropout)
         )
-        self.text_norm = nn.LayerNorm(dim * 4)  # Add normalization for text projections
+        # self.text_norm = nn.LayerNorm(dim * 4)  # Add normalization for text projections
 
         # determine dimensions
 
