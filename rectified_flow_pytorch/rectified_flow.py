@@ -126,7 +126,6 @@ class RectifiedFlow(Module):
     def __init__(
         self,
         model: dict | Module,
-        cfg_scale: float = 7.5,  # Default CFG guidance scale
         time_cond_kwarg: str | None = 'times',
         odeint_kwargs: dict = dict(
             atol = 1e-5,
@@ -160,8 +159,6 @@ class RectifiedFlow(Module):
         clip_flow_values: Tuple[float, float] = (-3., 3)
     ):
         super().__init__()
-
-        self.cfg_scale = cfg_scale
 
         if isinstance(model, dict):
             model = Unet(**model)
@@ -251,132 +248,43 @@ class RectifiedFlow(Module):
     def device(self):
         return next(self.model.parameters()).device
 
-    # def predict_flow(self, model: Module, noised, *, times, eps = 1e-10):
-    #     """
-    #     returns the model output as well as the derived flow, depending on the `predict` objective
-    #     """
-    #
-    #     batch = noised.shape[0]
-    #
-    #     # prepare maybe time conditioning for model
-    #
-    #     model_kwargs = dict()
-    #     time_kwarg = self.time_cond_kwarg
-    #
-    #     if exists(time_kwarg):
-    #         times = rearrange(times, '... -> (...)')
-    #
-    #         if times.numel() == 1:
-    #             times = repeat(times, '1 -> b', b = batch)
-    #
-    #         model_kwargs.update(**{time_kwarg: times})
-    #
-    #     output = self.model(noised, **model_kwargs)
-    #
-    #     # depending on objective, derive flow
-    #
-    #     if self.predict == 'flow':
-    #         flow = output
-    #
-    #     elif self.predict == 'noise':
-    #         noise = output
-    #         padded_times = append_dims(times, noised.ndim - 1)
-    #
-    #         flow = (noised - noise) / padded_times.clamp(min = eps)
-    #
-    #     else:
-    #         raise ValueError(f'unknown objective {self.predict}')
-    #
-    #     return output, flow
+    def predict_flow(self, model: Module, noised, *, times, eps = 1e-10):
+        """
+        returns the model output as well as the derived flow, depending on the `predict` objective
+        """
 
-    def predict_flow(self, model: Module, noised, *, times, text_embeds=None, eps = 1e-10):
         batch = noised.shape[0]
-        model_kwargs = dict()
 
-        # Handle time conditioning
+        # prepare maybe time conditioning for model
+
+        model_kwargs = dict()
         time_kwarg = self.time_cond_kwarg
+
         if exists(time_kwarg):
             times = rearrange(times, '... -> (...)')
+
             if times.numel() == 1:
                 times = repeat(times, '1 -> b', b = batch)
-            model_kwargs.update(**{time_kwarg: times})
 
-        # Improved text conditioning
-        if exists(text_embeds):
-            # Ensure text embeddings match batch size
-            if text_embeds.shape[0] == 1:
-                text_embeds = repeat(text_embeds, '1 ... -> b ...', b=batch)
-            elif text_embeds.shape[0] != batch:
-                raise ValueError(f'Text embeddings batch size {text_embeds.shape[0]} must match input batch size {batch}')
-            model_kwargs['text_embeds'] = text_embeds
+            model_kwargs.update(**{time_kwarg: times})
 
         output = self.model(noised, **model_kwargs)
 
+        # depending on objective, derive flow
+
         if self.predict == 'flow':
             flow = output
+
         elif self.predict == 'noise':
             noise = output
             padded_times = append_dims(times, noised.ndim - 1)
+
             flow = (noised - noise) / padded_times.clamp(min = eps)
 
-        return output, flow
+        else:
+            raise ValueError(f'unknown objective {self.predict}')
 
-    # @torch.no_grad()
-    # def sample(
-    #     self,
-    #     batch_size = 1,
-    #     steps = 16,
-    #     noise = None,
-    #     data_shape: Tuple[int, ...] | None = None,
-    #     use_ema: bool = False,
-    #     **model_kwargs
-    # ):
-    #     use_ema = default(use_ema, self.use_consistency)
-    #     assert not (use_ema and not self.use_consistency), 'in order to sample from an ema model, you must have `use_consistency` turned on'
-    #
-    #     model = self.ema_model if use_ema else self.model
-    #
-    #     was_training = self.training
-    #     self.eval()
-    #
-    #     data_shape = default(data_shape, self.data_shape)
-    #     assert exists(data_shape), 'you need to either pass in a `data_shape` or have trained at least with one forward'
-    #
-    #     # clipping still helps for predict noise objective
-    #     # much like original ddpm paper trick
-    #
-    #     maybe_clip = (lambda t: t.clamp_(*self.clip_values)) if self.clip_during_sampling else identity
-    #
-    #     maybe_clip_flow = (lambda t: t.clamp_(*self.clip_flow_values)) if self.clip_flow_during_sampling else identity
-    #
-    #     # ode step function
-    #
-    #     def ode_fn(t, x):
-    #         x = maybe_clip(x)
-    #
-    #         _, flow = self.predict_flow(model, x, times = t, **model_kwargs)
-    #
-    #         flow = maybe_clip_flow(flow)
-    #
-    #         return flow
-    #
-    #     # start with random gaussian noise - y0
-    #
-    #     noise = default(noise, torch.randn((batch_size, *data_shape), device = self.device))
-    #
-    #     # time steps
-    #
-    #     times = torch.linspace(0., 1., steps, device = self.device)
-    #
-    #     # ode
-    #
-    #     trajectory = odeint(ode_fn, noise, times, **self.odeint_kwargs)
-    #
-    #     sampled_data = trajectory[-1]
-    #
-    #     self.train(was_training)
-    #
-    #     return self.data_unnormalize_fn(sampled_data)
+        return output, flow
 
     @torch.no_grad()
     def sample(
@@ -384,49 +292,60 @@ class RectifiedFlow(Module):
         batch_size = 1,
         steps = 16,
         noise = None,
-        text_embeds = None,
-        cfg_scale = None,
         data_shape: Tuple[int, ...] | None = None,
         use_ema: bool = False,
         **model_kwargs
     ):
-        cfg_scale = default(cfg_scale, self.cfg_scale)
+        use_ema = default(use_ema, self.use_consistency)
+        assert not (use_ema and not self.use_consistency), 'in order to sample from an ema model, you must have `use_consistency` turned on'
+
         model = self.ema_model if use_ema else self.model
 
         was_training = self.training
         self.eval()
 
         data_shape = default(data_shape, self.data_shape)
+        assert exists(data_shape), 'you need to either pass in a `data_shape` or have trained at least with one forward'
+
+        # clipping still helps for predict noise objective
+        # much like original ddpm paper trick
+
         maybe_clip = (lambda t: t.clamp_(*self.clip_values)) if self.clip_during_sampling else identity
+
         maybe_clip_flow = (lambda t: t.clamp_(*self.clip_flow_values)) if self.clip_flow_during_sampling else identity
 
-        # Modified ODE function for CFG
+        # ode step function
+
         def ode_fn(t, x):
             x = maybe_clip(x)
 
-            # Get conditional and unconditional flows
-            _, cond_flow = self.predict_flow(model, x, times=t, text_embeds=text_embeds)
-            _, uncond_flow = self.predict_flow(model, x, times=t, text_embeds=None)  # unconditional
+            _, flow = self.predict_flow(model, x, times = t, **model_kwargs)
 
-            # Apply classifier-free guidance
-            flow = uncond_flow + cfg_scale * (cond_flow - uncond_flow)
             flow = maybe_clip_flow(flow)
 
             return flow
 
-        noise = default(noise, torch.randn((batch_size, *data_shape), device=self.device))
-        times = torch.linspace(0., 1., steps, device=self.device)
+        # start with random gaussian noise - y0
+
+        noise = default(noise, torch.randn((batch_size, *data_shape), device = self.device))
+
+        # time steps
+
+        times = torch.linspace(0., 1., steps, device = self.device)
+
+        # ode
 
         trajectory = odeint(ode_fn, noise, times, **self.odeint_kwargs)
+
         sampled_data = trajectory[-1]
 
         self.train(was_training)
+
         return self.data_unnormalize_fn(sampled_data)
 
     def forward(
         self,
         data,
-        text_embeds = None,  # Add text embeddings parameter
         noise: Tensor | None = None,
         return_loss_breakdown = False,
         **model_kwargs
@@ -452,9 +371,6 @@ class RectifiedFlow(Module):
 
         times = torch.rand(batch, device = self.device)
         padded_times = append_dims(times, data.ndim - 1)
-
-        # Add text_embeds to model_kwargs
-        model_kwargs['text_embeds'] = text_embeds
 
         # time needs to be from [0, 1 - delta_time] if using consistency loss
 
@@ -727,7 +643,6 @@ class Unet(Module):
     def __init__(
         self,
         dim,
-        text_embed_dim = 512,  # T5-small hidden size
         init_dim = None,
         out_dim = None,
         dim_mults: Tuple[int, ...] = (1, 2, 4, 8),
@@ -744,18 +659,6 @@ class Unet(Module):
         flash_attn = False
     ):
         super().__init__()
-
-        # Improved text embedding projection
-        self.text_proj = nn.Sequential(
-            nn.LayerNorm(text_embed_dim),  # Normalize first
-            nn.Linear(text_embed_dim, dim * 4),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim * 4, dim * 4),
-            nn.LayerNorm(dim * 4),  # Additional normalization
-            nn.Dropout(dropout)
-        )
-        # self.text_norm = nn.LayerNorm(dim * 4)  # Add normalization for text projections
 
         # determine dimensions
 
@@ -849,24 +752,13 @@ class Unet(Module):
     def downsample_factor(self):
         return 2 ** (len(self.downs) - 1)
 
-    def forward(self, x, times, text_embeds=None):
+    def forward(self, x, times):
         assert all([divisible_by(d, self.downsample_factor) for d in x.shape[-2:]]), f'your input dimensions {x.shape[-2:]} need to be divisible by {self.downsample_factor}, given the unet'
-
-        t = self.time_mlp(times)
-
-        # Enhanced text conditioning
-        if exists(text_embeds):
-            text_cond = self.text_proj(text_embeds)
-
-            # Cross-attention style conditioning
-            text_cond = rearrange(text_cond, 'b d -> b d 1 1')
-            t = t.unsqueeze(-1).unsqueeze(-1)  # Make compatible for broadcasting
-
-            # Combine time and text conditioning
-            t = t + text_cond
 
         x = self.init_conv(x)
         r = x.clone()
+
+        t = self.time_mlp(times)
 
         h = []
 
@@ -1057,9 +949,9 @@ class Trainer(Module):
     def load(self, path):
         if not self.is_main:
             return
-
+        
         load_package = torch.load(path)
-
+        
         self.model.load_state_dict(load_package["model"])
         self.ema_model.load_state_dict(load_package["ema_model"])
         self.optimizer.load_state_dict(load_package["optimizer"])
@@ -1078,7 +970,7 @@ class Trainer(Module):
 
         with torch.no_grad():
             sampled = eval_model.sample(batch_size=self.num_samples, data_shape=data_shape)
-
+      
         sampled = rearrange(sampled, '(row col) c h w -> c (row h) (col w)', row = self.num_sample_rows)
         sampled.clamp_(0., 1.)
 
